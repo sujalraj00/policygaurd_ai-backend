@@ -64,6 +64,14 @@ router.post('/upload', upload.single('policy_pdf'), async (req, res) => {
     const policy = policyResult.rows[0];
 
     // 4. Store each extracted rule
+    // toNumericOrNull: safety guard — prevents strings like "Reinvestment"
+    // from being passed to the NUMERIC threshold columns in policy_rules.
+    const toNumericOrNull = (v) => {
+      if (v === null || v === undefined) return null;
+      const n = parseFloat(v);
+      return isNaN(n) ? null : n;
+    };
+
     const savedRules = [];
     for (const rule of extractedRules) {
       const ruleResult = await query(
@@ -79,8 +87,8 @@ router.post('/upload', upload.single('policy_pdf'), async (req, res) => {
           rule.description,
           rule.field,
           rule.operator,
-          rule.threshold ?? null,
-          rule.threshold_secondary ?? null,
+          toNumericOrNull(rule.threshold),
+          toNumericOrNull(rule.threshold_secondary),
           JSON.stringify(rule.extra_conditions || {}),
           rule.severity || 'medium',
         ]
