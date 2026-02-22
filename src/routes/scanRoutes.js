@@ -2,6 +2,9 @@ const express = require('express');
 const router = express.Router();
 const { runScan } = require('../services/scanService');
 const { query } = require('../config/database');
+const { generateAuditReport } = require('../services/reportService');
+const { enqueueAllRules } = require('../jobs/scanWorker');
+const { scanQueue } = require('../jobs/scanQueue');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /scan — trigger a manual scan (all policies or one)
@@ -95,6 +98,36 @@ router.get('/logs/:id', async (req, res) => {
 
     return res.json({ success: true, log: result.rows[0] });
   } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+module.exports = router;
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /scan/queue — current job queue status
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/queue', (req, res) => {
+  res.json({ success: true, queue: scanQueue.getStatus() });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /scan/report — download PDF audit report
+// Query: ?start=YYYY-MM-DD&end=YYYY-MM-DD (defaults to last 30 days)
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/report', async (req, res) => {
+  try {
+    const { start, end } = req.query;
+    const pdfBuffer = await generateAuditReport(start, end);
+
+    const filename = `policyguard-audit-${new Date().toISOString().split('T')[0]}.pdf`;
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Length': pdfBuffer.length,
+    });
+    return res.end(pdfBuffer);
+  } catch (err) {
+    console.error('[REPORT] Error:', err.message);
     return res.status(500).json({ success: false, error: err.message });
   }
 });

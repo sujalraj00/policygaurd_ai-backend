@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../config/database');
+const { generateExclusion } = require('../services/feedbackService');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /violations — list all violations (with optional filters)
@@ -8,7 +9,7 @@ const { query } = require('../config/database');
 // ─────────────────────────────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const { policy_id, severity, label, limit = 50, offset = 0 } = req.query;
+    const { policy_id, severity, label, confidence, limit = 50, offset = 0 } = req.query;
 
     let conditions = [];
     let params = [];
@@ -26,6 +27,14 @@ router.get('/', async (req, res) => {
       conditions.push(`v.label = $${idx++}`);
       params.push(label);
     }
+    // Confidence filter: high(>=0.7) | medium(0.4-0.7) | low(<0.4)
+    if (confidence === 'high') {
+      conditions.push(`v.confidence >= 0.7`);
+    } else if (confidence === 'medium') {
+      conditions.push(`v.confidence >= 0.4 AND v.confidence < 0.7`);
+    } else if (confidence === 'low') {
+      conditions.push(`(v.confidence < 0.4 OR v.confidence IS NULL)`);
+    }
 
     const whereSQL = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
@@ -34,22 +43,27 @@ router.get('/', async (req, res) => {
          v.*,
          r.rule_name,
          r.rule_type,
-         p.name AS policy_name
+         p.name AS policy_name,
+         vr.action AS review_action,
+         vr.note AS review_note,
+         vr.reviewed_at,
+         CASE
+           WHEN v.confidence >= 0.7 THEN 'high'
+           WHEN v.confidence >= 0.4 THEN 'medium'
+           ELSE 'low'
+         END AS confidence_band,
+         CASE WHEN r.exclusion_conditions IS NOT NULL THEN true ELSE false END AS feedback_applied
        FROM violations v
        JOIN policy_rules r ON r.id = v.rule_id
        JOIN policies p ON p.id = v.policy_id
+       LEFT JOIN violation_reviews vr ON vr.violation_id = v.id
        ${whereSQL}
        ORDER BY v.detected_at DESC
        LIMIT $${idx++} OFFSET $${idx++}`,
       [...params, parseInt(limit), parseInt(offset)]
     );
 
-    const countResult = await query(
-      `SELECT COUNT(*) FROM violations v ${whereSQL}`,
-      params
-    );
-
-    // The Flutter app strictly expects a raw array: [{ "id": "...", "rule_name": "...", "status": "pending" }]
+    // Flutter app expects a raw array
     return res.json(result.rows);
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
@@ -135,6 +149,96 @@ router.patch('/:id', async (req, res) => {
 
     return res.json({ success: true, violation: result.rows[0] });
   } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /violations/:id/review — HITL human review action
+// Body: { action: 'confirm'|'false_positive'|'escalate', note?: string }
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/:id/review', async (req, res) => {
+  try {
+    const { action, note } = req.body;
+    const validActions = ['confirm', 'false_positive', 'escalate'];
+    if (!action || !validActions.includes(action)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid action. Must be one of: ${validActions.join(', ')}`,
+      });
+    }
+
+    // Fetch the violation with rule + raw record
+    const vRes = await query(
+      `SELECT v.*, r.id AS rule_uuid, r.rule_name, r.description AS rule_desc,
+              r.field, r.operator, r.threshold, r.policy_id
+       FROM violations v
+       JOIN policy_rules r ON r.id = v.rule_id
+       WHERE v.id = $1`,
+      [req.params.id]
+    );
+    if (vRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Violation not found' });
+    }
+    const violation = vRes.rows[0];
+
+    // Insert into violation_reviews
+    await query(
+      `INSERT INTO violation_reviews (violation_id, action, note) VALUES ($1, $2, $3)`,
+      [req.params.id, action, note || null]
+    );
+
+    // Update violation status to reflect review
+    const statusMap = {
+      confirm: 'confirmed',
+      false_positive: 'false_positive',
+      escalate: 'escalated',
+    };
+    await query(
+      `UPDATE violations SET status = $1 WHERE id = $2`,
+      [statusMap[action], req.params.id]
+    );
+
+    let exclusionSuggestion = null;
+
+    // If false positive: generate LLM exclusion condition and apply to rule
+    if (action === 'false_positive') {
+      const rawRecord = violation.raw_row || {};
+      const rule = {
+        description: violation.rule_desc,
+        rule_name: violation.rule_name,
+        field: violation.field,
+        operator: violation.operator,
+        threshold: violation.threshold,
+      };
+
+      exclusionSuggestion = await generateExclusion(rule, rawRecord);
+
+      if (exclusionSuggestion) {
+        // Append new exclusion to any existing ones with AND
+        await query(
+          `UPDATE policy_rules
+           SET exclusion_conditions = 
+             CASE
+               WHEN exclusion_conditions IS NULL OR exclusion_conditions = ''
+               THEN $1
+               ELSE exclusion_conditions || ' AND ' || $1
+             END
+           WHERE id = $2`,
+          [exclusionSuggestion, violation.rule_uuid]
+        );
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: `Violation reviewed as: ${action}`,
+      action,
+      exclusion_applied: exclusionSuggestion || null,
+      feedback_applied: action === 'false_positive' && !!exclusionSuggestion,
+    });
+  } catch (err) {
+    console.error('[REVIEW] Error:', err.message);
     return res.status(500).json({ success: false, error: err.message });
   }
 });

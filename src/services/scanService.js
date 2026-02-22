@@ -1,6 +1,7 @@
 const { query } = require('../config/database');
 const { buildQueryForRule } = require('./queryBuilder');
 const { generateExplanation } = require('./explanationService');
+const { scoreViolation } = require('./confidenceService');
 
 /**
  * Runs all active rules for a given policy (or all policies if policyId = null)
@@ -40,7 +41,7 @@ const runScan = async (policyId = null) => {
 
     let sql, params;
     try {
-      ({ sql, params } = buildQueryForRule(rule));
+      ({ sql, params } = await buildQueryForRule(rule));
     } catch (err) {
       console.error(`[SCAN] Failed to build query for rule ${rule.rule_name}:`, err.message);
       continue;
@@ -60,6 +61,9 @@ const runScan = async (policyId = null) => {
     for (const txn of matchedRows) {
       const { explanation, label, is_laundering, detected_value } = generateExplanation(rule, txn);
 
+      // Score confidence via Gemini (falls back to 0.5 if no API key)
+      const { confidence, reasoning: confidence_reasoning } = await scoreViolation(rule, txn);
+
       // IBM AML has no transaction_id column — use serial id as identifier
       const txnIdentifier = String(txn['Account'] ? `${txn['Account']}-${txn.id}` : txn.id);
 
@@ -71,18 +75,21 @@ const runScan = async (policyId = null) => {
 
       let violationId;
       if (existing.rows.length > 0) {
-        // Update existing violation (re-scan may update label/explanation)
+        // Update existing violation (re-scan may update label/explanation/confidence)
         await query(
-          `UPDATE violations SET explanation = $1, label = $2, is_laundering = $3, detected_at = NOW()
-           WHERE id = $4`,
-          [explanation, label, is_laundering, existing.rows[0].id]
+          `UPDATE violations
+           SET explanation = $1, label = $2, is_laundering = $3,
+               confidence = $4, confidence_reasoning = $5, detected_at = NOW()
+           WHERE id = $6`,
+          [explanation, label, is_laundering, confidence, confidence_reasoning, existing.rows[0].id]
         );
         violationId = existing.rows[0].id;
       } else {
         const ins = await query(
           `INSERT INTO violations 
-             (rule_id, policy_id, transaction_id, detected_value, explanation, severity, label, is_laundering, raw_row)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             (rule_id, policy_id, transaction_id, detected_value, explanation, severity,
+              label, is_laundering, raw_row, confidence, confidence_reasoning)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
            RETURNING id`,
           [
             rule.id,
@@ -94,6 +101,8 @@ const runScan = async (policyId = null) => {
             label,
             is_laundering,
             JSON.stringify(txn),
+            confidence,
+            confidence_reasoning,
           ]
         );
         violationId = ins.rows[0].id;
@@ -107,6 +116,8 @@ const runScan = async (policyId = null) => {
         label,
         severity: rule.severity,
         explanation,
+        confidence,
+        confidence_reasoning,
       });
     }
   }

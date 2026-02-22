@@ -131,6 +131,73 @@ const migrate = async () => {
       console.log('[MIGRATE] Seeded 10 sample transactions.');
     }
 
+    // ---------------------------------------------------------------
+    // Phase 2 upgrade: Additive columns on existing tables
+    // All use IF NOT EXISTS — safe to re-run on existing databases
+    // ---------------------------------------------------------------
+
+    // violations: add confidence scoring columns
+    await query(`ALTER TABLE violations ADD COLUMN IF NOT EXISTS confidence FLOAT`);
+    await query(`ALTER TABLE violations ADD COLUMN IF NOT EXISTS confidence_reasoning TEXT`);
+
+    // policy_rules: add incremental scan tracking + LLM fields + HITL exclusion
+    await query(`ALTER TABLE policy_rules ADD COLUMN IF NOT EXISTS last_scanned_at TIMESTAMPTZ`);
+    await query(`ALTER TABLE policy_rules ADD COLUMN IF NOT EXISTS exclusion_conditions TEXT`);
+    await query(`ALTER TABLE policy_rules ADD COLUMN IF NOT EXISTS rule_id TEXT`);
+    await query(`ALTER TABLE policy_rules ADD COLUMN IF NOT EXISTS context TEXT`);
+
+    // ---------------------------------------------------------------
+    // Phase 2 upgrade: New tables (all IF NOT EXISTS)
+    // ---------------------------------------------------------------
+
+    // query_audit_log: every generated SQL is logged
+    await query(`
+      CREATE TABLE IF NOT EXISTS query_audit_log (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        rule_id UUID REFERENCES policy_rules(id) ON DELETE SET NULL,
+        generated_sql TEXT,
+        params JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    // scan_history: per-rule scan stats (incremental scanning)
+    await query(`
+      CREATE TABLE IF NOT EXISTS scan_history (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        rule_id UUID REFERENCES policy_rules(id) ON DELETE CASCADE,
+        scan_start TIMESTAMPTZ,
+        scan_end TIMESTAMPTZ,
+        records_scanned INT DEFAULT 0,
+        violations_found INT DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    // violation_reviews: HITL human review decisions
+    await query(`
+      CREATE TABLE IF NOT EXISTS violation_reviews (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        violation_id UUID NOT NULL REFERENCES violations(id) ON DELETE CASCADE,
+        action TEXT NOT NULL CHECK (action IN ('confirm', 'false_positive', 'escalate')),
+        note TEXT,
+        reviewed_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    // policy_chunks: RAG pipeline - stores text chunks with embeddings as JSONB
+    await query(`
+      CREATE TABLE IF NOT EXISTS policy_chunks (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        policy_id UUID REFERENCES policies(id) ON DELETE CASCADE,
+        chunk_index INT,
+        chunk_text TEXT,
+        embedding JSONB,
+        page_number INT DEFAULT 1,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
     console.log('[MIGRATE] Migration completed successfully.');
   } catch (err) {
     console.error('[MIGRATE] Migration failed:', err.message);

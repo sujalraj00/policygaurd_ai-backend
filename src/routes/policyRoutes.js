@@ -5,7 +5,14 @@ const fs = require('fs');
 
 const upload = require('../middleware/upload');
 const { extractTextFromPDF, extractRulesFromText } = require('../services/pdfService');
+const { extractRulesWithLLM } = require('../services/llmPdfService');
+const { chunkAndEmbed } = require('../services/ragService');
 const { query } = require('../config/database');
+
+// ── Parser mode: 'keyword' (default) | 'llm'
+// Change PARSER_MODE in .env to toggle. No code changes needed.
+const PARSER_MODE = process.env.PARSER_MODE || 'keyword';
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /policy/upload
@@ -41,8 +48,11 @@ router.post('/upload', upload.single('policy_pdf'), async (req, res) => {
       console.warn('[POLICY] Parse warning (using empty text):', err.message);
     }
 
-    // 2. Simulate LLM rule extraction
-    const extractedRules = extractRulesFromText(rawText);
+    // 2. Extract rules — keyword parser OR Gemini LLM (controlled by PARSER_MODE env var)
+    console.log(`[POLICY] Using parser mode: ${PARSER_MODE}`);
+    const extractedRules = PARSER_MODE === 'llm'
+      ? await extractRulesWithLLM(rawText)
+      : extractRulesFromText(rawText);
 
     // 3. Store policy in DB
     const policyResult = await query(
@@ -77,6 +87,11 @@ router.post('/upload', upload.single('policy_pdf'), async (req, res) => {
       );
       savedRules.push(ruleResult.rows[0]);
     }
+
+    // 5. RAG: chunk and embed policy text in background (non-blocking)
+    chunkAndEmbed(rawText, policy.id).catch(err =>
+      console.warn('[POLICY] RAG embedding skipped:', err.message)
+    );
 
     // Clean up uploaded file (optional — keep for audit trail in production)
     // fs.unlinkSync(filePath);

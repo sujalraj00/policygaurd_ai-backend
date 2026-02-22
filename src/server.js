@@ -9,6 +9,7 @@ const scanRoutes = require('./routes/scanRoutes');
 const violationRoutes = require('./routes/violationRoutes');
 const transactionRoutes = require('./routes/transactionRoutes');
 const { startMonitoring } = require('./jobs/monitorJob');
+const { startWorkers } = require('./jobs/scanWorker');
 const { pool } = require('./config/database');
 
 const app = express();
@@ -55,9 +56,15 @@ app.use((req, res) => {
       'DELETE /policy/:id',
       'POST /scan',
       'GET  /scan/logs',
+      'GET  /scan/logs/:id',
+      'GET  /scan/queue',
+      'GET  /scan/report?start=YYYY-MM-DD&end=YYYY-MM-DD',
       'GET  /violations',
+      'GET  /violations?confidence=high|medium|low',
       'GET  /violations/summary',
       'GET  /violations/:id',
+      'POST /violations/:id/review',
+      'PATCH /violations/:id',
       'GET  /transactions',
       'GET  /transactions/:id',
     ],
@@ -94,8 +101,11 @@ app.listen(PORT, async () => {
     console.error('[DB] Make sure your .env is configured and `npm run migrate` was run.');
   }
 
-  // Start cron-based monitoring
+  // Start cron-based monitoring (now a queue scheduler)
   startMonitoring();
+
+  // Register scan worker to process rule jobs from the queue
+  startWorkers();
 });
 
 module.exports = app;
